@@ -8,9 +8,15 @@
     <script src="https://cdn.tailwindcss.com"></script>
     <!-- Google Fonts (Inter) -->
     <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
-    <!-- Lucide Icons -->
-    <script src="https://unpkg.com/lucide-react@latest/dist/lucide-react.js"></script>
     
+    <!-- 
+      FIREBASE COMPATIBILITY SCRIPTS
+      These are the v8 SDKs that work without <script type="module">
+    -->
+    <script src="https://www.gstatic.com/firebasejs/8.10.1/firebase-app.js"></script>
+    <script src="https://www.gstatic.com/firebasejs/8.10.1/firebase-auth.js"></script>
+    <script src="https://www.gstatic.com/firebasejs/8.10.1/firebase-firestore.js"></script>
+
     <style>
         body {
             font-family: 'Inter', sans-serif;
@@ -380,30 +386,10 @@
 
     <!-- 
       =======================================================
-      JAVASCRIPT & FIREBASE
+      JAVASCRIPT & FIREBASE (COMPATIBILITY MODE)
       =======================================================
     -->
-    <script type="module">
-        // Import Firebase services
-        import { initializeApp } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-app.js";
-        import { 
-            getAuth, 
-            createUserWithEmailAndPassword, 
-            signInWithEmailAndPassword, 
-            signOut, 
-            onAuthStateChanged,
-            updateProfile
-        } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-auth.js";
-        import { 
-            getFirestore, 
-            doc, 
-            setDoc, 
-            getDoc,
-            onSnapshot,
-            collection,
-            query
-        } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-firestore.js";
-
+    <script>
         // ======================================================
         // START: Firebase Configuration
         // This is YOUR project config.
@@ -422,9 +408,9 @@
         // ======================================================
 
         // Initialize Firebase
-        const app = initializeApp(firebaseConfig);
-        const auth = getAuth(app);
-        const db = getFirestore(app);
+        firebase.initializeApp(firebaseConfig);
+        const auth = firebase.auth();
+        const db = firebase.firestore();
 
         // This `appId` is provided by the environment you run in.
         // It's used to separate data in Firestore.
@@ -438,6 +424,8 @@
             focusTime: 0, // in minutes
             tasks: []
         };
+        let unsubscribeUser = null; // To stop the listener on logout
+        let unsubscribeLeaderboard = null; // To stop the listener on logout
 
         // Pomodoro Timer state
         let timerInterval = null;
@@ -516,7 +504,13 @@
             allPages.forEach(page => {
                 page.classList.remove("active");
             });
-            document.getElementById(pageId).classList.add("active");
+            const newPage = document.getElementById(pageId);
+            if (newPage) {
+                newPage.classList.add("active");
+            } else {
+                console.error("Page not found:", pageId);
+                document.getElementById("pageDashboard").classList.add("active"); // Fallback
+            }
 
             // Update Island Menu active state
             navButtons.forEach(button => {
@@ -534,7 +528,7 @@
         // ======================================================
 
         // Main auth state listener
-        onAuthStateChanged(auth, async (user) => {
+        auth.onAuthStateChanged(async (user) => {
             if (user) {
                 // User is signed in
                 currentUserId = user.uid;
@@ -547,14 +541,16 @@
                 await loadUserData(user.uid);
 
                 // Check for admin claims (this is an advanced feature)
-                const idTokenResult = await user.getIdTokenResult();
-                if (idTokenResult.claims.admin) {
-                    adminButton.classList.remove("hidden");
-                }
+                user.getIdTokenResult().then((idTokenResult) => {
+                    if (idTokenResult.claims.admin) {
+                        adminButton.classList.remove("hidden");
+                    }
+                });
                 
                 // Show app, hide auth
                 appContainer.classList.remove("hidden");
                 authContainer.classList.add("hidden");
+                navigateTo("pageDashboard");
                 
                 // Set up real-time data listeners
                 setupListeners(user.uid);
@@ -562,6 +558,10 @@
             } else {
                 // User is signed out
                 currentUserId = null;
+                
+                // Stop listeners
+                if (unsubscribeUser) unsubscribeUser();
+                if (unsubscribeLeaderboard) unsubscribeLeaderboard();
                 
                 // Show auth, hide app
                 authContainer.classList.remove("hidden");
@@ -580,11 +580,11 @@
             const password = document.getElementById("registerPassword").value;
 
             try {
-                const userCredential = await createUserWithEmailAndPassword(auth, email, password);
+                const userCredential = await auth.createUserWithEmailAndPassword(email, password);
                 const user = userCredential.user;
                 
                 // Update Firebase Auth profile
-                await updateProfile(user, { displayName: name });
+                await user.updateProfile({ displayName: name });
                 
                 // Create initial user data in Firestore
                 const initialData = {
@@ -594,11 +594,12 @@
                     focusTime: 0,
                     tasks: []
                 };
+                
                 // Create private user doc
-                await setDoc(doc(db, `artifacts/${appId}/users/${user.uid}/appData`, "data"), initialData);
+                await getUserDocRef(user.uid).set(initialData);
                 
                 // Create public leaderboard doc
-                await setDoc(doc(db, `artifacts/${appId}/public/data/leaderboard`, user.uid), {
+                await getLeaderboardDocRef(user.uid).set({
                     name: name,
                     coins: 0
                 });
@@ -618,7 +619,7 @@
             const password = document.getElementById("loginPassword").value;
             
             try {
-                await signInWithEmailAndPassword(auth, email, password);
+                await auth.signInWithEmailAndPassword(email, password);
                 // `onAuthStateChanged` will handle navigation
             } catch (error) {
                 showNotification(`Login failed: ${error.message}`);
@@ -629,7 +630,7 @@
         // Logout
         logoutButton.addEventListener("click", async () => {
             try {
-                await signOut(auth);
+                await auth.signOut();
                 // `onAuthStateChanged` will handle navigation
             } catch (error) {
                 showNotification(`Logout failed: ${error.message}`);
@@ -664,30 +665,33 @@
         adminButton.addEventListener("click", () => navigateTo("pageAdmin"));
 
         // ======================================================
-        // Firestore Data Management
+        // Firestore Data Management (Compat Mode)
         // ======================================================
         
         // Get user data doc reference
         function getUserDocRef(userId) {
-            return doc(db, `artifacts/${appId}/users/${userId}/appData`, "data");
+            return db.collection(`artifacts/${appId}/users/${userId}/appData`).doc("data");
         }
         
         // Get leaderboard doc reference
         function getLeaderboardDocRef(userId) {
-            return doc(db, `artifacts/${appId}/public/data/leaderboard`, userId);
+            return db.collection(`artifacts/${appId}/public/data/leaderboard`).doc(userId);
         }
 
         // Load user data once on login
         async function loadUserData(userId) {
             const docRef = getUserDocRef(userId);
-            const docSnap = await getDoc(docRef);
-
-            if (docSnap.exists()) {
-                userData = docSnap.data();
-                updateUI();
-            } else {
-                console.warn("No user data found, but this should have been created on register.");
-                // This state is unlikely if registration is correct
+            try {
+                const docSnap = await docRef.get();
+                if (docSnap.exists) {
+                    userData = docSnap.data();
+                    updateUI();
+                } else {
+                    console.warn("No user data found, but this should have been created on register.");
+                }
+            } catch (error) {
+                console.error("Error loading user data:", error);
+                showNotification("Could not load user data. Firestore rules may be incorrect.");
             }
         }
         
@@ -695,7 +699,7 @@
         async function saveUserData() {
             if (!currentUserId) return;
             try {
-                await setDoc(getUserDocRef(currentUserId), userData);
+                await getUserDocRef(currentUserId).set(userData);
             } catch (error) {
                 console.error("Error saving user data:", error);
                 showNotification("Error saving data. Please check console.");
@@ -706,7 +710,7 @@
         async function updateLeaderboardData(name, coins) {
             if (!currentUserId) return;
              try {
-                await setDoc(getLeaderboardDocRef(currentUserId), { name, coins });
+                await getLeaderboardDocRef(currentUserId).set({ name, coins });
             } catch (error) {
                 console.error("Error saving leaderboard data:", error);
             }
@@ -714,10 +718,14 @@
         
         // Set up real-time listeners
         function setupListeners(userId) {
+            // Stop any old listeners
+            if (unsubscribeUser) unsubscribeUser();
+            if (unsubscribeLeaderboard) unsubscribeLeaderboard();
+            
             // 1. Listen for changes to this user's private data
             const userDocRef = getUserDocRef(userId);
-            onSnapshot(userDocRef, (doc) => {
-                if (doc.exists()) {
+            unsubscribeUser = userDocRef.onSnapshot((doc) => {
+                if (doc.exists) {
                     userData = doc.data();
                     updateUI();
                 }
@@ -726,21 +734,23 @@
             });
             
             // 2. Listen for changes to the public leaderboard
-            const leaderboardCollectionRef = collection(db, `artifacts/${appId}/public/data/leaderboard`);
-            const q = query(leaderboardCollectionRef); // You can add orderBy and limit here
+            const leaderboardCollectionRef = db.collection(`artifacts/${appId}/public/data/leaderboard`);
+            // Query for top 10, ordered by coins
+            const q = leaderboardCollectionRef.orderBy("coins", "desc").limit(10);
             
-            onSnapshot(q, (snapshot) => {
+            unsubscribeLeaderboard = q.onSnapshot((snapshot) => {
                 let leaderboard = [];
                 snapshot.forEach((doc) => {
                     leaderboard.push(doc.data());
                 });
                 
-                // Sort by coins (descending) in JavaScript
-                leaderboard.sort((a, b) => b.coins - a.coins);
-                
                 // Render leaderboard
                 leaderboardList.innerHTML = ""; // Clear list
-                leaderboard.slice(0, 10).forEach((entry, index) => { // Show top 10
+                if (leaderboard.length === 0) {
+                     leaderboardList.innerHTML = `<p class="text-gray-500 text-center">Be the first on the leaderboard!</p>`;
+                }
+                
+                leaderboard.forEach((entry, index) => { 
                     const li = document.createElement("li");
                     li.className = "flex items-center justify-between p-3 bg-gray-50 rounded-lg";
                     li.innerHTML = `
@@ -752,6 +762,11 @@
                 
             }, (error) => {
                  console.error("Error with leaderboard snapshot:", error);
+                 // This often fails if the Firestore rules are wrong OR the index is missing.
+                 if (error.code === 'failed-precondition') {
+                     console.error("Firestore Index Missing! You must create an index for the leaderboard.");
+                     showNotification("Leaderboard error: A Firestore index is required. Check the console (F12) for a link to create it.");
+                 }
             });
         }
         
@@ -791,7 +806,7 @@
                 li.innerHTML = `
                     <div class="flex items-center space-x-3">
                         <input type="checkbox" data-id="${task.id}" class="task-checkbox h-5 w-5 text-blue-600 border-gray-300 rounded focus:ring-blue-500" ${task.completed ? 'checked' : ''}>
-                        <label for="task-${task.id}" class="text-gray-800">${task.text}</label>
+                        <label class="text-gray-800">${task.text}</label>
                     </div>
                     <button data-id="${task.id}" class="delete-task-btn p-1 text-gray-400 hover:text-red-500 rounded-full">
                         <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M6 18L18 6M6 6l12 12"></path></svg>
@@ -826,10 +841,11 @@
                 const taskId = target.dataset.id;
                 const task = userData.tasks.find(t => t.id === taskId);
                 if (task) {
+                    const wasCompleted = task.completed;
                     task.completed = target.checked;
                     
-                    // Add coins for completing a task
-                    if (task.completed) {
+                    // Add coins for completing a task (but only once)
+                    if (task.completed && !wasCompleted) {
                         userData.coins += 10; // Give 10 coins
                         await updateLeaderboardData(userData.name, userData.coins);
                     }
@@ -912,5 +928,4 @@
     </script>
 </body>
 </html>
-
 
